@@ -7,7 +7,7 @@ const eachSeries = require('async/eachSeries')
 const Stoplight = require('./util/stoplight.js')
 const cacheUtils = require('./util/rpc-cache-utils.js')
 const createPayload = require('./util/create-payload.js')
-const noop = function(){}
+const noop = function () { }
 
 module.exports = Web3ProviderEngine
 
@@ -27,25 +27,12 @@ function Web3ProviderEngine(opts) {
   self._blockTracker = opts.blockTracker || new EthBlockTracker({
     provider: blockTrackerProvider,
     pollingInterval: opts.pollingInterval || 4000,
+    setSkipCacheFlag: true,
   })
-
-  // handle new block
-  self._blockTracker.on('block', (jsonBlock) => {
-    const bufferBlock = toBufferBlock(jsonBlock)
-    self._setCurrentBlock(bufferBlock)
-  })
-
-  // emit block events from the block tracker
-  self._blockTracker.on('block', self.emit.bind(self, 'rawBlock'))
-  self._blockTracker.on('sync', self.emit.bind(self, 'sync'))
-  self._blockTracker.on('latest', self.emit.bind(self, 'latest'))
 
   // set initialization blocker
   self._ready = new Stoplight()
-  // unblock initialization after first block
-  self._blockTracker.once('block', () => {
-    self._ready.go()
-  })
+
   // local state
   self.currentBlock = null
   self._providers = []
@@ -56,31 +43,82 @@ function Web3ProviderEngine(opts) {
 
 // public
 
-Web3ProviderEngine.prototype.start = function(cb = noop){
+Web3ProviderEngine.prototype.start = function (cb = noop) {
   const self = this
-  // start block polling
-  self._blockTracker.start().then(cb).catch(cb)
+
+  // trigger start
+  self._ready.go()
+
+  // on new block, request block body and emit as events
+  self._blockTracker.on('latest', (blockNumber) => {
+    // get block body
+    self._getBlockByNumber(blockNumber, (err, block) => {
+      if (err) {
+        this.emit('error', err)
+        return
+      }
+      if (!block) {
+        this.emit('error', new Error("Could not find block"))
+        return
+      }
+      const bufferBlock = toBufferBlock(block)
+      // set current + emit "block" event
+      self._setCurrentBlock(bufferBlock)
+      // emit other events
+      self.emit('rawBlock', block)
+      self.emit('latest', block)
+    })
+  })
+
+  // forward other events
+  self._blockTracker.on('sync', self.emit.bind(self, 'sync'))
+  self._blockTracker.on('error', self.emit.bind(self, 'error'))
+
+  // update state
+  self._running = true
+  // signal that we started
+  self.emit('start')
 }
 
-Web3ProviderEngine.prototype.stop = function(){
+Web3ProviderEngine.prototype.stop = function () {
   const self = this
-  // stop block polling
-  self._blockTracker.stop()
+  // stop block polling by removing event listeners
+  self._blockTracker.removeAllListeners()
+  // update state
+  self._running = false
+  // signal that we stopped
+  self.emit('stop')
 }
 
-Web3ProviderEngine.prototype.addProvider = function(source){
+Web3ProviderEngine.prototype.isRunning = function () {
   const self = this
-  self._providers.push(source)
+  return self._running
+}
+
+Web3ProviderEngine.prototype.addProvider = function (source, index) {
+  const self = this
+  if (typeof index === 'number') {
+    self._providers.splice(index, 0, source)
+  } else {
+    self._providers.push(source)
+  }
   source.setEngine(this)
 }
 
-Web3ProviderEngine.prototype.send = function(payload, cb){
+Web3ProviderEngine.prototype.send = function (payload, cb) {
   this.sendAsync(payload, cb);
 }
 
-Web3ProviderEngine.prototype.sendAsync = function(payload, cb){
+Web3ProviderEngine.prototype.removeProvider = function (source) {
   const self = this
-  self._ready.await(function(){
+  const index = self._providers.indexOf(source)
+  if (index < 0) throw new Error('Provider not found.')
+  self._providers.splice(index, 1)
+}
+
+Web3ProviderEngine.prototype.sendAsync = function (payload, cb) {
+  const self = this
+  self._ready.await(function () {
 
     if (Array.isArray(payload)) {
       // handle batch
@@ -95,7 +133,15 @@ Web3ProviderEngine.prototype.sendAsync = function(payload, cb){
 
 // private
 
-Web3ProviderEngine.prototype._handleAsync = function(payload, finished) {
+Web3ProviderEngine.prototype._getBlockByNumber = function (blockNumber, cb) {
+  const req = createPayload({ method: 'eth_getBlockByNumber', params: [blockNumber, false], skipCache: true })
+  this._handleAsync(req, (err, res) => {
+    if (err) return cb(err)
+    return cb(null, res.result)
+  })
+}
+
+Web3ProviderEngine.prototype._handleAsync = function (payload, finished) {
   var self = this
   var currentProvider = -1
   var result = null
@@ -131,16 +177,14 @@ Web3ProviderEngine.prototype._handleAsync = function(payload, finished) {
     error = _error
     result = _result
 
-    eachSeries(stack, function(fn, callback) {
+    eachSeries(stack, function (fn, callback) {
 
       if (fn) {
         fn(error, result, callback)
       } else {
         callback()
       }
-    }, function() {
-      // console.log('COMPLETED:', payload)
-      // console.log('RESULT: ', result)
+    }, function () {
 
       var resultObj = {
         id: payload.id,
@@ -166,7 +210,7 @@ Web3ProviderEngine.prototype._handleAsync = function(payload, finished) {
 // from remote-data
 //
 
-Web3ProviderEngine.prototype._setCurrentBlock = function(block){
+Web3ProviderEngine.prototype._setCurrentBlock = function (block) {
   const self = this
   self.currentBlock = block
   self.emit('block', block)
@@ -174,26 +218,26 @@ Web3ProviderEngine.prototype._setCurrentBlock = function(block){
 
 // util
 
-function toBufferBlock (jsonBlock) {
+function toBufferBlock(jsonBlock) {
   return {
-    number:           ethUtil.toBuffer(jsonBlock.number),
-    hash:             ethUtil.toBuffer(jsonBlock.hash),
-    parentHash:       ethUtil.toBuffer(jsonBlock.parentHash),
-    nonce:            ethUtil.toBuffer(jsonBlock.nonce),
-    mixHash:          ethUtil.toBuffer(jsonBlock.mixHash),
-    sha3Uncles:       ethUtil.toBuffer(jsonBlock.sha3Uncles),
-    logsBloom:        ethUtil.toBuffer(jsonBlock.logsBloom),
+    number: ethUtil.toBuffer(jsonBlock.number),
+    hash: ethUtil.toBuffer(jsonBlock.hash),
+    parentHash: ethUtil.toBuffer(jsonBlock.parentHash),
+    nonce: ethUtil.toBuffer(jsonBlock.nonce),
+    mixHash: ethUtil.toBuffer(jsonBlock.mixHash),
+    sha3Uncles: ethUtil.toBuffer(jsonBlock.sha3Uncles),
+    logsBloom: ethUtil.toBuffer(jsonBlock.logsBloom),
     transactionsRoot: ethUtil.toBuffer(jsonBlock.transactionsRoot),
-    stateRoot:        ethUtil.toBuffer(jsonBlock.stateRoot),
-    receiptsRoot:     ethUtil.toBuffer(jsonBlock.receiptRoot || jsonBlock.receiptsRoot),
-    miner:            ethUtil.toBuffer(jsonBlock.miner),
-    difficulty:       ethUtil.toBuffer(jsonBlock.difficulty),
-    totalDifficulty:  ethUtil.toBuffer(jsonBlock.totalDifficulty),
-    size:             ethUtil.toBuffer(jsonBlock.size),
-    extraData:        ethUtil.toBuffer(jsonBlock.extraData),
-    gasLimit:         ethUtil.toBuffer(jsonBlock.gasLimit),
-    gasUsed:          ethUtil.toBuffer(jsonBlock.gasUsed),
-    timestamp:        ethUtil.toBuffer(jsonBlock.timestamp),
-    transactions:     jsonBlock.transactions,
+    stateRoot: ethUtil.toBuffer(jsonBlock.stateRoot),
+    receiptsRoot: ethUtil.toBuffer(jsonBlock.receiptRoot || jsonBlock.receiptsRoot),
+    miner: ethUtil.toBuffer(jsonBlock.miner),
+    difficulty: ethUtil.toBuffer(jsonBlock.difficulty),
+    totalDifficulty: ethUtil.toBuffer(jsonBlock.totalDifficulty),
+    size: ethUtil.toBuffer(jsonBlock.size),
+    extraData: ethUtil.toBuffer(jsonBlock.extraData),
+    gasLimit: ethUtil.toBuffer(jsonBlock.gasLimit),
+    gasUsed: ethUtil.toBuffer(jsonBlock.gasUsed),
+    timestamp: ethUtil.toBuffer(jsonBlock.timestamp),
+    transactions: jsonBlock.transactions,
   }
 }
